@@ -6,11 +6,13 @@
 //! pairs, without re-reading any file contents.
 
 use crate::scanner::scan_project;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 /// A SHA-256 content hash, stored as raw bytes.
 ///
@@ -33,6 +35,61 @@ impl fmt::Debug for FileHash {
     // byte array, which keeps assert failure messages readable.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
+    }
+}
+
+/// Parses a 64-digit hex string, the inverse of `Display`.
+impl FromStr for FileHash {
+    type Err = ParseHashError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        // Work on raw bytes: slicing a &str at odd offsets would panic on
+        // multi-byte characters, while non-ASCII input just fails hex_val.
+        let bytes = s.as_bytes();
+        if bytes.len() != 64 {
+            return Err(ParseHashError);
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = hex_val(bytes[2 * i])? << 4 | hex_val(bytes[2 * i + 1])?;
+        }
+        Ok(FileHash(out))
+    }
+}
+
+fn hex_val(b: u8) -> Result<u8, ParseHashError> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(ParseHashError),
+    }
+}
+
+/// Error returned when a string isn't 64 hexadecimal digits.
+#[derive(Debug)]
+pub struct ParseHashError;
+
+impl fmt::Display for ParseHashError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid file hash: expected 64 hexadecimal digits")
+    }
+}
+
+impl std::error::Error for ParseHashError {}
+
+// Manifests store hashes as hex strings, matching Display's output, so the
+// JSON stays human-readable and diffable with plain text tools.
+impl Serialize for FileHash {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for FileHash {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(de::Error::custom)
     }
 }
 
@@ -85,11 +142,8 @@ mod tests {
     impl TestProject {
         fn new() -> Self {
             let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-            let root = std::env::temp_dir().join(format!(
-                "daw-hash-test-{}-{}",
-                std::process::id(),
-                id
-            ));
+            let root =
+                std::env::temp_dir().join(format!("daw-hash-test-{}-{}", std::process::id(), id));
             fs::create_dir_all(&root).unwrap();
             TestProject { root }
         }
