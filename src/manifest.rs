@@ -63,6 +63,46 @@ impl Manifest {
             files,
         })
     }
+
+    /// The baseline manifest a fresh repo diffs against: empty id, epoch
+    /// timestamp, no message, no files.
+    pub fn empty() -> Self {
+        Manifest {
+            id: String::new(),
+            created_at: 0,
+            message: None,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// Formats seconds since the unix epoch as UTC `YYYY-MM-DD HH:MM`.
+///
+/// Hand-rolled days-to-date conversion (Howard Hinnant's `civil_from_days`)
+/// so `daw log` doesn't need a datetime dependency.
+pub fn fmt_timestamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}",
+        secs_of_day / 3600,
+        (secs_of_day / 60) % 60
+    )
+}
+
+/// Converts a day count relative to 1970-01-01 into (year, month, day).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468; // shift epoch to 0000-03-01
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // year of era
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
+    let mp = (5 * doy + 2) / 153; // month index, Mar = 0 … Feb = 11
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 /// Serializes a path with `/` separators regardless of platform.
@@ -155,5 +195,26 @@ mod tests {
         assert!(json.contains(
             "\"hash\":\"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881\""
         ));
+    }
+
+    #[test]
+    fn empty_manifest_has_no_files() {
+        let m = Manifest::empty();
+
+        assert_eq!(m.id, "");
+        assert_eq!(m.created_at, 0);
+        assert_eq!(m.message, None);
+        assert!(m.files.is_empty());
+    }
+
+    #[test]
+    fn fmt_timestamp_epoch() {
+        assert_eq!(fmt_timestamp(0), "1970-01-01 00:00");
+    }
+
+    #[test]
+    fn fmt_timestamp_known_date() {
+        // Verified against `date -u -r 1792465196 "+%Y-%m-%d %H:%M"`.
+        assert_eq!(fmt_timestamp(1_792_465_196), "2026-10-20 02:59");
     }
 }

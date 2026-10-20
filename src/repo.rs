@@ -16,6 +16,7 @@
 //! a `blobs/` directory later without changing this layout. The scanner never
 //! picks up `.daw/` itself — it only takes top-level `*.als` and `Samples/`.
 
+use crate::diff::{diff_manifests, Diff};
 use crate::manifest::Manifest;
 use std::ffi::OsStr;
 use std::fs;
@@ -86,9 +87,49 @@ impl Repo {
     }
 
     /// Reads back the manifest stored as `.daw/snapshots/<id>.json`.
+    ///
+    /// A missing id reports `NotFound` with the id in the message rather
+    /// than the raw filesystem error, so `daw diff 0009` reads sensibly.
     pub fn read_snapshot(&self, id: &str) -> io::Result<Manifest> {
-        let json = fs::read_to_string(self.snapshots_dir().join(format!("{id}.json")))?;
+        let path = self.snapshots_dir().join(format!("{id}.json"));
+        let json = fs::read_to_string(&path).map_err(|e| {
+            if e.kind() == ErrorKind::NotFound {
+                io::Error::new(ErrorKind::NotFound, format!("snapshot {id} not found"))
+            } else {
+                e
+            }
+        })?;
         serde_json::from_str(&json).map_err(|e| io::Error::new(ErrorKind::InvalidData, e))
+    }
+
+    /// The most recent snapshot, or `None` before the first one.
+    pub fn latest_snapshot(&self) -> io::Result<Option<Manifest>> {
+        match self.list_snapshots()?.last() {
+            Some(id) => Ok(Some(self.read_snapshot(id)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// What the working tree looks like relative to the latest snapshot
+    /// (or to nothing, before the first snapshot).
+    pub fn status(&self) -> io::Result<Diff> {
+        let base = self.latest_snapshot()?.unwrap_or_else(Manifest::empty);
+        let working = Manifest::capture(&self.root, "working".into(), None)?;
+        Ok(diff_manifests(&base, &working))
+    }
+
+    /// Compares two stored snapshots, `a` as the older side.
+    pub fn diff_snapshots(&self, a: &str, b: &str) -> io::Result<Diff> {
+        Ok(diff_manifests(
+            &self.read_snapshot(a)?,
+            &self.read_snapshot(b)?,
+        ))
+    }
+
+    /// Compares a stored snapshot to the current working tree.
+    pub fn diff_snapshot_to_working(&self, a: &str) -> io::Result<Diff> {
+        let working = Manifest::capture(&self.root, "working".into(), None)?;
+        Ok(diff_manifests(&self.read_snapshot(a)?, &working))
     }
 
     /// Snapshot ids in chronological order (zero-padded ids sort correctly).
@@ -127,7 +168,7 @@ impl Repo {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
+    use std::fs::{self, File};
     use std::io::Write;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -230,5 +271,86 @@ mod tests {
 
         assert_eq!(second.files.len(), 1);
         assert_eq!(second.files[0].path, "Project.als");
+    }
+
+    fn change_lines(diff: &Diff) -> Vec<String> {
+        diff.changes.iter().map(|c| c.to_string()).collect()
+    }
+
+    #[test]
+    fn status_before_first_snapshot_marks_all_added() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        project.write("Samples/kick.wav", b"audio");
+        let repo = Repo::init(&project.root).unwrap();
+
+        let diff = repo.status().unwrap();
+
+        assert_eq!(
+            change_lines(&diff),
+            vec!["A  Project.als", "A  Samples/kick.wav"]
+        );
+    }
+
+    #[test]
+    fn status_after_unchanged_snapshot_is_clean() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        let repo = Repo::init(&project.root).unwrap();
+        repo.create_snapshot(None).unwrap();
+
+        let diff = repo.status().unwrap();
+
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn status_reports_add_modify_delete() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        project.write("Samples/kick.wav", b"audio");
+        project.write("Samples/hat.wav", b"hat");
+        let repo = Repo::init(&project.root).unwrap();
+        repo.create_snapshot(None).unwrap();
+
+        project.write("Samples/kick.wav", b"edited");
+        project.write("Samples/snare.wav", b"new");
+        fs::remove_file(project.root.join("Samples/hat.wav")).unwrap();
+
+        let diff = repo.status().unwrap();
+
+        assert_eq!(
+            change_lines(&diff),
+            vec![
+                "D  Samples/hat.wav",
+                "M  Samples/kick.wav",
+                "A  Samples/snare.wav"
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_snapshots_compares_two_stored_manifests() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        let repo = Repo::init(&project.root).unwrap();
+        repo.create_snapshot(None).unwrap();
+        project.write("Project.als", b"v2");
+        repo.create_snapshot(None).unwrap();
+
+        let diff = repo.diff_snapshots("0001", "0002").unwrap();
+
+        assert_eq!(change_lines(&diff), vec!["M  Project.als"]);
+    }
+
+    #[test]
+    fn read_snapshot_missing_id_is_not_found() {
+        let project = TestProject::new();
+        let repo = Repo::init(&project.root).unwrap();
+
+        let err = repo.read_snapshot("0009").unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(err.to_string(), "snapshot 0009 not found");
     }
 }

@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(before.len(), after.len());
         for (old, new) in before.iter().zip(after.iter()) {
             assert_eq!(old.0, new.0); // same paths
-            if old.0 == PathBuf::from("Samples/kick.wav") {
+            if old.0 == Path::new("Samples/kick.wav") {
                 assert_ne!(old.1, new.1); // changed file changed hash
             } else {
                 assert_eq!(old.1, new.1); // untouched file kept hash
