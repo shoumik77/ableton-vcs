@@ -1,50 +1,66 @@
-use std::env;
-use std::path::Path;
+use clap::{Parser, Subcommand};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-// Hand-rolled subcommand dispatch for now — clap arrives in a later
-// milestone once the command surface stabilises.
-fn main() -> ExitCode {
-    let Some(command) = env::args().nth(1) else {
-        usage();
-        return ExitCode::FAILURE;
-    };
+// clap owns argument parsing; each cmd_* below maps a parsed subcommand to
+// a repo operation and decides the exit code.
+#[derive(Parser)]
+#[command(name = "daw", about = "Version control for Ableton Live projects")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 
-    match command.as_str() {
-        "init" => cmd_init(env::args().nth(2)),
-        "snapshot" => cmd_snapshot(env::args().skip(2)),
-        "hash" => cmd_hash(env::args().nth(2)),
-        "status" => cmd_status(env::args().nth(2)),
-        "diff" => cmd_diff(env::args().skip(2)),
-        "log" => cmd_log(env::args().nth(2)),
-        _ => {
-            eprintln!("unknown command: {command}");
-            usage();
-            ExitCode::FAILURE
-        }
+#[derive(Subcommand)]
+enum Command {
+    /// Start tracking a project directory
+    Init {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Record a manifest of the project
+    Snapshot {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        #[arg(short, long)]
+        message: Option<String>,
+    },
+    /// Show added/modified/deleted files vs the latest snapshot
+    Status {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Compare two snapshots, or a snapshot to the working tree
+    Diff {
+        a: String,
+        b: Option<String>,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
+    /// List snapshots, newest first
+    Log {
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
+    /// Debug: print hash + path for every scanned file
+    Hash { dir: PathBuf },
+}
+
+fn main() -> ExitCode {
+    match Cli::parse().command {
+        Command::Init { dir } => cmd_init(&dir),
+        Command::Snapshot { dir, message } => cmd_snapshot(&dir, message),
+        Command::Status { dir } => cmd_status(&dir),
+        Command::Diff { a, b, dir } => cmd_diff(&a, b.as_deref(), &dir),
+        Command::Log { dir } => cmd_log(&dir),
+        Command::Hash { dir } => cmd_hash(&dir),
     }
 }
 
-fn usage() {
-    eprintln!("usage:");
-    eprintln!("  daw init [dir]                 start tracking a project directory");
-    eprintln!("  daw snapshot [dir] [-m msg]    record a manifest of the project");
-    eprintln!("  daw hash <dir>                 debug: print hash + path per scanned file");
-    eprintln!(
-        "  daw status [dir]               show added/modified/deleted files vs latest snapshot"
-    );
-    eprintln!("  daw diff <a> [b] [--dir dir]   compare two snapshots (or a vs working tree)");
-    eprintln!("  daw log [dir]                  list snapshots, newest first");
-}
-
-fn cmd_init(dir: Option<String>) -> ExitCode {
-    let dir = dir.unwrap_or_else(|| ".".into());
-    match daw::repo::Repo::init(Path::new(&dir)) {
+fn cmd_init(dir: &Path) -> ExitCode {
+    match daw::repo::Repo::init(dir) {
         Ok(_) => {
-            println!(
-                "initialised {}",
-                Path::new(&dir).join(daw::repo::DIR).display()
-            );
+            println!("initialised {}", dir.join(daw::repo::DIR).display());
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -54,26 +70,8 @@ fn cmd_init(dir: Option<String>) -> ExitCode {
     }
 }
 
-fn cmd_snapshot(mut args: impl Iterator<Item = String>) -> ExitCode {
-    // `daw snapshot [dir] [-m message]`: first bare argument is the project
-    // dir, `-m`/`--message` consumes the next argument.
-    let mut dir = ".".to_string();
-    let mut message = None;
-    while let Some(arg) = args.next() {
-        if arg == "-m" || arg == "--message" {
-            match args.next() {
-                Some(m) => message = Some(m),
-                None => {
-                    eprintln!("error: {arg} requires a value");
-                    return ExitCode::FAILURE;
-                }
-            }
-        } else {
-            dir = arg;
-        }
-    }
-
-    match daw::repo::Repo::open(Path::new(&dir)).and_then(|r| r.create_snapshot(message)) {
+fn cmd_snapshot(dir: &Path, message: Option<String>) -> ExitCode {
+    match daw::repo::Repo::open(dir).and_then(|r| r.create_snapshot(message)) {
         Ok(manifest) => {
             println!("snapshot {} — {} files", manifest.id, manifest.files.len());
             ExitCode::SUCCESS
@@ -85,13 +83,8 @@ fn cmd_snapshot(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-fn cmd_hash(dir: Option<String>) -> ExitCode {
-    let Some(dir) = dir else {
-        eprintln!("usage: daw hash <project-dir>");
-        return ExitCode::FAILURE;
-    };
-
-    match daw::hash::hash_project(Path::new(&dir)) {
+fn cmd_hash(dir: &Path) -> ExitCode {
+    match daw::hash::hash_project(dir) {
         Ok(entries) => {
             for (path, hash) in entries {
                 println!("{hash}  {}", path.display());
@@ -119,9 +112,8 @@ fn print_diff(diff: &daw::diff::Diff, exit_on_changes: ExitCode) -> ExitCode {
     }
 }
 
-fn cmd_status(dir: Option<String>) -> ExitCode {
-    let dir = dir.unwrap_or_else(|| ".".into());
-    match daw::repo::Repo::open(Path::new(&dir)).and_then(|r| r.status()) {
+fn cmd_status(dir: &Path) -> ExitCode {
+    match daw::repo::Repo::open(dir).and_then(|r| r.status()) {
         Ok(diff) => print_diff(&diff, ExitCode::from(1)),
         Err(e) => {
             eprintln!("error: {e}");
@@ -130,31 +122,8 @@ fn cmd_status(dir: Option<String>) -> ExitCode {
     }
 }
 
-fn cmd_diff(mut args: impl Iterator<Item = String>) -> ExitCode {
-    // `daw diff <a> [b] [--dir path]`: bare arguments are snapshot ids;
-    // omitting `b` compares `a` to the working tree.
-    let mut ids = Vec::new();
-    let mut dir = ".".to_string();
-    while let Some(arg) = args.next() {
-        if arg == "--dir" {
-            match args.next() {
-                Some(d) => dir = d,
-                None => {
-                    eprintln!("error: --dir requires a value");
-                    return ExitCode::FAILURE;
-                }
-            }
-        } else {
-            ids.push(arg);
-        }
-    }
-
-    let Some(a) = ids.first() else {
-        eprintln!("usage: daw diff <a> [b] [--dir dir]");
-        return ExitCode::FAILURE;
-    };
-
-    let result = daw::repo::Repo::open(Path::new(&dir)).and_then(|repo| match ids.get(1) {
+fn cmd_diff(a: &str, b: Option<&str>, dir: &Path) -> ExitCode {
+    let result = daw::repo::Repo::open(dir).and_then(|repo| match b {
         Some(b) => repo.diff_snapshots(a, b),
         None => repo.diff_snapshot_to_working(a),
     });
@@ -168,10 +137,9 @@ fn cmd_diff(mut args: impl Iterator<Item = String>) -> ExitCode {
     }
 }
 
-fn cmd_log(dir: Option<String>) -> ExitCode {
-    let dir = dir.unwrap_or_else(|| ".".into());
-    let result: std::io::Result<Vec<daw::manifest::Manifest>> =
-        daw::repo::Repo::open(Path::new(&dir)).and_then(|repo| {
+fn cmd_log(dir: &Path) -> ExitCode {
+    let result: std::io::Result<Vec<daw::manifest::Manifest>> = daw::repo::Repo::open(dir)
+        .and_then(|repo| {
             // Newest first: list is chronological, so walk it backwards.
             repo.list_snapshots()?
                 .iter()
@@ -200,5 +168,16 @@ fn cmd_log(dir: Option<String>) -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_is_well_formed() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 }
