@@ -44,6 +44,15 @@ enum Command {
     },
     /// Debug: print hash + path for every scanned file
     Hash { dir: PathBuf },
+    /// Restore the working tree to a snapshot
+    Restore {
+        id: String,
+        /// Overwrite even if the working tree has unsnapshotted changes
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -54,6 +63,7 @@ fn main() -> ExitCode {
         Command::Diff { a, b, dir } => cmd_diff(&a, b.as_deref(), &dir),
         Command::Log { dir } => cmd_log(&dir),
         Command::Hash { dir } => cmd_hash(&dir),
+        Command::Restore { id, force, dir } => cmd_restore(&id, force, &dir),
     }
 }
 
@@ -161,6 +171,26 @@ fn cmd_log(dir: &Path) -> ExitCode {
                     m.files.len(),
                     m.message.as_deref().unwrap_or("")
                 );
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_restore(id: &str, force: bool, dir: &Path) -> ExitCode {
+    match daw::repo::Repo::open(dir).and_then(|r| r.restore(id, force)) {
+        Ok(plan) => {
+            if plan.is_empty() {
+                println!("already at {id}");
+            } else {
+                for change in &plan.changes {
+                    println!("{change}");
+                }
+                println!("restored {id}");
             }
             ExitCode::SUCCESS
         }

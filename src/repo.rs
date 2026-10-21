@@ -7,17 +7,24 @@
 //! ├── Project.als
 //! ├── Samples/…
 //! └── .daw/
-//!     └── snapshots/
-//!         ├── 0001.json
-//!         └── 0002.json
+//!     ├── snapshots/
+//!     │   ├── 0001.json
+//!     │   └── 0002.json
+//!     └── objects/
+//!         ├── <hex-sha256>    one blob per unique file content
+//!         └── …
 //! ```
 //!
-//! Snapshots are content manifests, not file copies. Restore support can add
-//! a `blobs/` directory later without changing this layout. The scanner never
-//! picks up `.daw/` itself — it only takes top-level `*.als` and `Samples/`.
+//! Snapshots are content manifests; `objects/` holds the file contents they
+//! reference, named by hash so identical files are stored once. The scanner
+//! never picks up `.daw/` itself — it only takes top-level `*.als` and
+//! `Samples/`.
 
-use crate::diff::{diff_manifests, Diff};
+use crate::diff::{diff_manifests, Change, Diff};
+use crate::hash::FileHash;
 use crate::manifest::Manifest;
+use reflink_copy::reflink_or_copy;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, ErrorKind};
@@ -27,6 +34,8 @@ use std::path::{Path, PathBuf};
 pub const DIR: &str = ".daw";
 /// Subdirectory of `.daw/` holding one JSON manifest per snapshot.
 const SNAPSHOTS: &str = "snapshots";
+/// Subdirectory of `.daw/` holding file contents addressed by content hash.
+const OBJECTS: &str = "objects";
 
 /// A project directory that `daw` is tracking.
 #[derive(Debug)]
@@ -50,6 +59,7 @@ impl Repo {
             ));
         }
         fs::create_dir_all(repo.snapshots_dir())?;
+        fs::create_dir_all(repo.objects_dir())?;
         Ok(repo)
     }
 
@@ -67,14 +77,114 @@ impl Repo {
                 ),
             ));
         }
+        // Repos initialised before blob storage existed lack objects/;
+        // create it on open so they keep working.
+        fs::create_dir_all(repo.objects_dir())?;
         Ok(repo)
     }
 
+    /// Stores `src`'s contents as a blob named by `hash`, if not present.
+    ///
+    /// The copy lands in a temp file first and is renamed into place, so a
+    /// crash mid-copy can never leave a half-written blob under its real
+    /// name — a later snapshot would mistake it for valid content.
+    fn store_blob(&self, src: &Path, hash: &FileHash) -> io::Result<()> {
+        let dest = self.blob_path(hash);
+        if dest.exists() {
+            return Ok(());
+        }
+        let tmp = self
+            .objects_dir()
+            .join(format!(".tmp-{hash}-{}", std::process::id()));
+        if let Err(e) = reflink_or_copy(src, &tmp) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(&tmp, dest)
+    }
+
     /// Hashes the working tree and stores the result as the next snapshot.
+    ///
+    /// Every file's blob is stored before the manifest is written, so a
+    /// persisted snapshot never references content that isn't on disk.
     pub fn create_snapshot(&self, message: Option<String>) -> io::Result<Manifest> {
         let manifest = Manifest::capture(&self.root, self.next_snapshot_id()?, message)?;
+        for entry in &manifest.files {
+            self.store_blob(&self.root.join(&entry.path), &entry.hash)?;
+        }
         self.write_snapshot(&manifest)?;
         Ok(manifest)
+    }
+
+    /// Restores the working tree to snapshot `id`.
+    ///
+    /// With `force` false, refuses to run while the tree has unsnapshotted
+    /// changes. Returns the plan applied: `Added`/`Modified` paths were
+    /// written from the target's blobs, `Deleted` paths were removed.
+    /// Unchanged files and empty directories are left alone.
+    pub fn restore(&self, id: &str, force: bool) -> io::Result<Diff> {
+        let target = self.read_snapshot(id)?;
+        let working = Manifest::capture(&self.root, "working".into(), None)?;
+
+        if !force {
+            let base = self.latest_snapshot()?.unwrap_or_else(Manifest::empty);
+            if !diff_manifests(&base, &working).is_empty() {
+                return Err(io::Error::other(
+                    "working tree has changes; run `daw snapshot` first or pass --force",
+                ));
+            }
+        }
+
+        let plan = diff_manifests(&working, &target);
+
+        // Target blob lookup by path, for the integrity pre-pass and the
+        // copy step below.
+        let target_hash: HashMap<&str, &FileHash> = target
+            .files
+            .iter()
+            .map(|e| (e.path.as_str(), &e.hash))
+            .collect();
+
+        // Verify every blob the restore needs before touching the working
+        // tree — discovering a hole halfway would leave it half-restored.
+        for change in &plan.changes {
+            let write_target = match change {
+                Change::Added { path } | Change::Modified { path } => Some(path),
+                Change::Deleted { .. } => None,
+            };
+            if let Some(path) = write_target {
+                let hash = target_hash[path.as_str()];
+                if !self.blob_path(hash).exists() {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "blob {hash} for {path} is missing (snapshot predates blob storage?)"
+                        ),
+                    ));
+                }
+            }
+        }
+
+        for change in &plan.changes {
+            match change {
+                Change::Added { path } | Change::Modified { path } => {
+                    let dest = self.root.join(path);
+                    fs::create_dir_all(dest.parent().unwrap())?;
+                    // APFS clonefile refuses to overwrite, so remove first.
+                    match fs::remove_file(&dest) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
+                    reflink_or_copy(self.blob_path(target_hash[path.as_str()]), &dest)?;
+                }
+                Change::Deleted { path } => {
+                    fs::remove_file(self.root.join(path))?;
+                }
+            }
+        }
+
+        Ok(plan)
     }
 
     /// Writes `manifest` as `<id>.json` under `.daw/snapshots/`.
@@ -163,6 +273,15 @@ impl Repo {
     fn snapshots_dir(&self) -> PathBuf {
         self.root.join(DIR).join(SNAPSHOTS)
     }
+
+    fn objects_dir(&self) -> PathBuf {
+        self.root.join(DIR).join(OBJECTS)
+    }
+
+    /// Where the blob for `hash` lives: `.daw/objects/<hex>`.
+    fn blob_path(&self, hash: &FileHash) -> PathBuf {
+        self.objects_dir().join(hash.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -191,6 +310,10 @@ mod tests {
             let path = self.root.join(rel);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             File::create(path).unwrap().write_all(contents).unwrap();
+        }
+
+        fn read(&self, rel: &str) -> Vec<u8> {
+            fs::read(self.root.join(rel)).unwrap()
         }
     }
 
@@ -352,5 +475,165 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert_eq!(err.to_string(), "snapshot 0009 not found");
+    }
+
+    #[test]
+    fn snapshot_stores_one_blob_per_unique_hash() {
+        let project = TestProject::new();
+        project.write("Samples/a.wav", b"same audio");
+        project.write("Samples/b.wav", b"same audio");
+        project.write("Samples/c.wav", b"different");
+        let repo = Repo::init(&project.root).unwrap();
+
+        repo.create_snapshot(None).unwrap();
+
+        // Two unique contents → two blobs, named by hex hash.
+        let blobs: Vec<_> = fs::read_dir(project.root.join(".daw/objects"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(blobs.len(), 2);
+        for name in &blobs {
+            assert_eq!(name.len(), 64);
+            assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        // Contents round-trip: read each blob back via the manifest hashes.
+        let m = repo.read_snapshot("0001").unwrap();
+        for entry in &m.files {
+            let blob = fs::read(
+                project
+                    .root
+                    .join(".daw/objects")
+                    .join(entry.hash.to_string()),
+            )
+            .unwrap();
+            assert_eq!(blob, project.read(&entry.path));
+        }
+    }
+
+    #[test]
+    fn restore_round_trip() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        project.write("Samples/kick.wav", b"kick v1");
+        project.write("Samples/hat.wav", b"hat v1");
+        let repo = Repo::init(&project.root).unwrap();
+        repo.create_snapshot(None).unwrap();
+
+        project.write("Samples/kick.wav", b"kick v2");
+        fs::remove_file(project.root.join("Samples/hat.wav")).unwrap();
+        project.write("Samples/snare.wav", b"snare");
+
+        let diff = repo.restore("0001", true).unwrap();
+
+        assert_eq!(project.read("Samples/kick.wav"), b"kick v1");
+        assert_eq!(project.read("Samples/hat.wav"), b"hat v1");
+        assert!(!project.root.join("Samples/snare.wav").exists());
+        assert_eq!(
+            change_lines(&diff),
+            vec![
+                "A  Samples/hat.wav",
+                "M  Samples/kick.wav",
+                "D  Samples/snare.wav"
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_refuses_dirty_tree() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        let repo = Repo::init(&project.root).unwrap();
+        repo.create_snapshot(None).unwrap();
+        project.write("Project.als", b"unsnapshotted edit");
+
+        let result = repo.restore("0001", false);
+
+        assert!(result.is_err());
+        assert_eq!(project.read("Project.als"), b"unsnapshotted edit");
+    }
+
+    #[test]
+    fn restore_clean_tree_to_older_snapshot_without_force() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        let repo = Repo::init(&project.root).unwrap();
+        repo.create_snapshot(None).unwrap();
+        project.write("Project.als", b"v2");
+        repo.create_snapshot(None).unwrap();
+
+        // Tree matches the latest snapshot, so no --force needed.
+        repo.restore("0001", false).unwrap();
+
+        assert_eq!(project.read("Project.als"), b"v1");
+    }
+
+    #[test]
+    fn restore_is_noop_when_already_there() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        let repo = Repo::init(&project.root).unwrap();
+        repo.create_snapshot(None).unwrap();
+
+        let diff = repo.restore("0001", true).unwrap();
+
+        assert!(diff.is_empty());
+    }
+
+    #[test]
+    fn restore_missing_blob_errors_before_writing() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        project.write("Samples/kick.wav", b"kick v1");
+        project.write("Samples/hat.wav", b"hat v1");
+        let repo = Repo::init(&project.root).unwrap();
+        let m = repo.create_snapshot(None).unwrap();
+
+        // Corrupt the repo: delete kick's blob.
+        let kick_hash = &m
+            .files
+            .iter()
+            .find(|e| e.path == "Samples/kick.wav")
+            .unwrap()
+            .hash;
+        fs::remove_file(
+            project
+                .root
+                .join(".daw/objects")
+                .join(kick_hash.to_string()),
+        )
+        .unwrap();
+
+        project.write("Samples/kick.wav", b"kick v2");
+        fs::remove_file(project.root.join("Samples/hat.wav")).unwrap();
+
+        let err = repo.restore("0001", true).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        // Nothing applied: kick keeps the modified bytes, hat stays gone.
+        assert_eq!(project.read("Samples/kick.wav"), b"kick v2");
+        assert!(!project.root.join("Samples/hat.wav").exists());
+    }
+
+    #[test]
+    fn restore_unknown_id_is_not_found() {
+        let project = TestProject::new();
+        project.write("Project.als", b"v1");
+        let repo = Repo::init(&project.root).unwrap();
+
+        let err = repo.restore("0009", true).unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn open_creates_objects_dir_for_legacy_repo() {
+        let project = TestProject::new();
+        // Simulate a pre-M6 repo: snapshots dir exists, objects dir doesn't.
+        fs::create_dir_all(project.root.join(".daw/snapshots")).unwrap();
+
+        Repo::open(&project.root).unwrap();
+
+        assert!(project.root.join(".daw/objects").is_dir());
     }
 }
